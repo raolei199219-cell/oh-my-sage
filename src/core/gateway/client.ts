@@ -261,7 +261,7 @@ class ECJPAKE {
 export class GatewayClient {
     private ws: WebSocket | null = null;
     private sessionIdCounter = 0;
-    private pendingRequests = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+    private pendingRequests = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer?: NodeJS.Timeout }>();
     private handshakeFrames: Buffer[] = [];
     private handshakeError: Error | null = null;
     private handshakeWaiters: Array<{ resolve: (data: Buffer) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }> = [];
@@ -269,6 +269,10 @@ export class GatewayClient {
     private cipherIn: AESGCMCipher | null = null;
     private secureEstablished = false;
     private connected = false;
+    /** 帧解析错误节流：首条打印，其余计数后按周期汇总 */
+    private frameErrorCount = 0;
+    private frameErrorLastPrint = 0;
+    private static readonly FRAME_ERROR_SUMMARY_INTERVAL_MS = 60000;
 
     private static parseUrl(url: string): string {
         const match = url.match(/^(https?):\/\/([^/:]+)(?::(\d+))?((?:\/.*)?)/);
@@ -299,6 +303,9 @@ export class GatewayClient {
                     clearTimeout(waiter.timer);
                     waiter.reject(error);
                 }
+                // 已建立会话后断线：立即让所有等待中的 API 调用失败，而不是各自等超时
+                this.rejectAllPending(new Error('Gateway connection closed'));
+                this.flushFrameErrors();
                 reject(error);
             };
             // Listen before sending anything: authentication frames may arrive back-to-back.
@@ -346,6 +353,22 @@ export class GatewayClient {
         });
     }
 
+    /**
+     * 认证被网关以非预期帧拒绝时，包装成带操作提示的错误。
+     *
+     * 实测与官方前端（ref/ai-config-v5）文案：「无论输入的登录码是否正确，
+     * 再次输入都需要重新获取登录码」。即登录码是一次性的，复用旧码会在此处
+     * 收到 ERROR(type 4)。这里统一提醒，避免用户/LLM 反复用旧码重试。
+     */
+    private authRejectedError(responseType: number): Error {
+        if (responseType === DATA_TYPE.ERROR) {
+            return new Error(
+                '登录码已被使用或无效，请重新获取一个新的登录码后再试（登录码是一次性的，每次连接都需要新的登录码）。'
+            );
+        }
+        return new Error(`Unexpected response type: ${responseType}`);
+    }
+
     async authenticate(passcode: string): Promise<void> {
         const jpake = new ECJPAKE(passcode, 'client');
 
@@ -359,7 +382,7 @@ export class GatewayClient {
 
         response = await this.recv();
         if (response[0] !== DATA_TYPE.ECJPAKE_ROUND_ONE) {
-            throw new Error(`Unexpected response type: ${response[0]}`);
+            throw this.authRejectedError(response[0]);
         }
         jpake.readRoundOne(response.slice(1));
 
@@ -368,7 +391,7 @@ export class GatewayClient {
 
         response = await this.recv();
         if (response[0] !== DATA_TYPE.ECJPAKE_ROUND_TWO) {
-            throw new Error(`Unexpected response type: ${response[0]}`);
+            throw this.authRejectedError(response[0]);
         }
         const serverRoundTwo = response.slice(1);
 
@@ -427,16 +450,54 @@ export class GatewayClient {
             if ('id' in response) {
                 const future = this.pendingRequests.get(response.id);
                 if (future) {
-                    this.pendingRequests.delete(response.id);
                     if ('result' in response) {
+                        this.pendingRequests.delete(response.id);
+                        clearTimeout(future.timer);
                         future.resolve(response.result);
                     } else if ('error' in response) {
+                        this.pendingRequests.delete(response.id);
+                        clearTimeout(future.timer);
                         future.reject(new Error(response.error?.message || 'Unknown error'));
                     }
                 }
             }
         } catch (e) {
-            console.error('[!] Error handling message:', e);
+            this.reportFrameError(e);
+        }
+    }
+
+    /** 帧错误节流输出：首条只打印消息，其后计数，每 60 秒最多汇总一次 */
+    private reportFrameError(e: unknown): void {
+        const now = Date.now();
+        if (this.frameErrorLastPrint === 0) {
+            this.frameErrorLastPrint = now;
+            console.error('[!] Error handling message:', String(e));
+            return;
+        }
+        this.frameErrorCount++;
+        if (now - this.frameErrorLastPrint >= GatewayClient.FRAME_ERROR_SUMMARY_INTERVAL_MS) {
+            console.error(`[!] suppressed ${this.frameErrorCount} gateway frame errors`);
+            this.frameErrorCount = 0;
+            this.frameErrorLastPrint = now;
+        }
+    }
+
+    /** 连接结束时输出尚未汇总的帧错误计数，并重置节流状态，使下一次连接的首条错误立即打印 */
+    private flushFrameErrors(): void {
+        if (this.frameErrorCount > 0) {
+            console.error(`[!] suppressed ${this.frameErrorCount} gateway frame errors`);
+        }
+        this.frameErrorCount = 0;
+        this.frameErrorLastPrint = 0;
+    }
+
+    /** 拒绝并清理所有等待中的 API 请求 */
+    private rejectAllPending(error: Error): void {
+        const pending = [...this.pendingRequests.values()];
+        this.pendingRequests.clear();
+        for (const future of pending) {
+            clearTimeout(future.timer);
+            future.reject(error);
         }
     }
 
@@ -454,21 +515,28 @@ export class GatewayClient {
         };
 
         return new Promise<T>((resolve, reject) => {
-            this.pendingRequests.set(requestId, {
+            const future: { resolve: (value: unknown) => void; reject: (error: Error) => void; timer?: NodeJS.Timeout } = {
                 resolve: resolve as (value: unknown) => void,
-                reject
-            });
+                reject,
+            };
+            this.pendingRequests.set(requestId, future);
 
-            const jsonData = Buffer.from(JSON.stringify(request), 'utf8');
-            const compressed = compress(jsonData);
-            const encrypted = this.cipherOut!.encrypt(compressed);
-            const message = Buffer.alloc(1 + encrypted.length);
-            message[0] = DATA_TYPE.DATA;
-            encrypted.copy(message, 1);
-            this.ws!.send(message);
+            try {
+                const jsonData = Buffer.from(JSON.stringify(request), 'utf8');
+                const compressed = compress(jsonData);
+                const encrypted = this.cipherOut!.encrypt(compressed);
+                const message = Buffer.alloc(1 + encrypted.length);
+                message[0] = DATA_TYPE.DATA;
+                encrypted.copy(message, 1);
+                this.ws!.send(message);
+            } catch (sendError) {
+                this.pendingRequests.delete(requestId);
+                reject(sendError instanceof Error ? sendError : new Error(String(sendError)));
+                return;
+            }
 
-            setTimeout(() => {
-                if (this.pendingRequests.has(requestId)) {
+            future.timer = setTimeout(() => {
+                if (this.pendingRequests.get(requestId) === future) {
                     this.pendingRequests.delete(requestId);
                     reject(new Error(`API call timeout: ${method}`));
                 }
@@ -491,6 +559,8 @@ export class GatewayClient {
             clearTimeout(waiter.timer);
             waiter.reject(this.handshakeError);
         }
+        this.rejectAllPending(new Error('Gateway connection closed'));
+        this.flushFrameErrors();
         if (this.ws) {
             this.ws.close();
             this.ws = null;
